@@ -2,7 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import distance_matrix
 from scipy.stats import norm
-from scipy.special import factorial
 import matplotlib.cm as cm
 import copy
 from tqdm import tqdm
@@ -52,35 +51,7 @@ def log_prior(u, K_inverse):
     return -0.5 * (n*log2pi - np.linalg.slogdet(K_inverse)[1] + u @ K_inverse @ u)
 
 
-def log_continuous_likelihood(u, v, G):
-    # TODO: Return observation likelihood p(v|u)
-    n = len(v)
-    mu = v - G @ u
-    return -0.5 * (n*log2pi + mu @ mu)
 
-
-def log_probit_likelihood(u, t, G):
-    phi = norm.cdf(G @ u)
-    # TODO: Return likelihood p(t|u)
-    return t @ np.log(phi) + (1. - t) @ np.log(1. - phi)
-
-
-def log_poisson_likelihood(u, c, G):
-    # TODO: Return likelihood p(c|u)
-    Gu = G @ u
-    return np.sum(c * Gu - np.exp(Gu) - np.log(factorial(c, exact=False)))
-
-
-def log_continuous_target(u, y, K_inverse, G):
-    return log_prior(u, K_inverse) + log_continuous_likelihood(u, y, G)
-
-
-def log_probit_target(u, t, K_inverse, G):
-    return log_prior(u, K_inverse) + log_probit_likelihood(u, t, G)
-
-
-def log_poisson_target(u, c, K_inverse, G):
-    return log_prior(u, K_inverse) + log_poisson_likelihood(u, c, G)
 
 
 ###--- MCMC ---###
