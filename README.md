@@ -30,8 +30,7 @@ gpr_mcmc.gpr_mcmc.GaussianProcessMCMCRegressor
 >>> gpmr.score(X_test, y_test, method="mae") # mean absolute error
 ```
 
-See [demo.ipynb](demo.ipynb) for a real example.
-
+See [demo.ipynb](demo.ipynb) for a real example using spatial data.
 ### Main options
 
 - `mcmc_method`: MCMC variant to use. "grw" is Gaussian random walk - Metropolis-Hastings with a Gaussian prior proposal. "pcn" is preconditioned Crank-Nicholson which does not degenerate in infinite-dimensions.

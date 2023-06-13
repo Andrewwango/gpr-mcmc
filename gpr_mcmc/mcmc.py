@@ -1,102 +1,141 @@
+from typing import Callable
 from tqdm import tqdm
 import numpy as np
 
 log2pi = np.log(2*np.pi)
 
-def log_gaussian_prior(u, K_inverse):
-    return -0.5 * (len(u)*log2pi - np.linalg.slogdet(K_inverse)[1] + u @ K_inverse @ u)
+def log_gaussian_prior(u: np.ndarray, K_inv: np.ndarray) -> np.ndarray:
+    """Prior probability according to Gaussian Process zero-mean prior
 
-def mcmc_mh_grw(log_likelihood, u0, data, K, G, n_iters, beta, rng=np.random.default_rng(), log_prior=None):
-    """ Gaussian random walk Metropolis-Hastings MCMC method
-        for sampling from pdf defined by log_target.
-    Inputs:
-        log_target - log-target density
-        u0 - initial sample
-        y - observed data
-        K - prior covariance
-        G - observation matrix
-        n_iters - number of samples
-        beta - step-size parameter
+    Args:
+        u (np.ndarray): data
+        K_inv (np.ndarray): inverse covariance matrix
+
     Returns:
-        X - samples from target distribution
-        acc/n_iters - the proportion of accepted samples"""
+        np.ndarray: prior probability of data
+    """
+    return -0.5 * (len(u) * log2pi - np.linalg.slogdet(K_inv)[1] + u @ K_inv @ u)
+
+def cholesky_decomposition(K: np.ndarray) -> np.ndarray:
+    """Calculate Cholesky decomposition of covariance matrix K
+
+    Args:
+        K (np.ndarray): covariance matrix
+
+    Returns:
+        np.ndarray: Cholesky decomposition C such that K = C @ C.T
+    """
+    N = K.shape[0]
+    return np.linalg.cholesky(K + 1e-6 * np.eye(N))
+
+def mcmc_mh_grw(
+        log_likelihood: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray], 
+        data: np.ndarray,
+        K: np.ndarray,
+        mask: np.ndarray,
+        n_iters: int,
+        beta: float,
+        rng: np.random.Generator = np.random.default_rng(),
+        log_prior: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None
+        ):
+    """MCMC using Gaussian random walk proposal to sample from log_likelihood, assuming the Gaussian Process prior.
+
+    Args:
+        log_likelihood (Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]): log likelihood to sample from.
+        data (np.ndarray): observed data
+        K (np.ndarray): Gaussian process prior covariance matrix
+        mask (np.ndarray): data observation mask
+        n_iters (int): number of iterations to run MCMC
+        beta (float): step-size
+        rng (np.random.Generator, optional): random number generator. Defaults to np.random.default_rng().
+        log_prior (Callable[[np.ndarray, np.ndarray], np.ndarray] | None, optional): log prior distribution, if None this is the Gaussian Process prior. Defaults to None.
+
+    Returns:
+        X: list of samples
+    """
     
     log_prior = log_prior if log_prior is not None else log_gaussian_prior
 
-    def log_target(u, y, K_inverse, G):
-        return log_prior(u, K_inverse) + log_likelihood(u, y, G)
+    # Note in GRW we are actually sampling from the posterior "target", incorporating the Gaussian process prior
+    def log_posterior(u, v, K_inverse, mask):
+        return log_prior(u, K_inverse) + log_likelihood(u, v, mask)
+
+    # Compute inverse
+    Kc = cholesky_decomposition(K)
+    Kc_inv = np.linalg.inv(Kc)
+    K_inv = Kc_inv @ Kc_inv.T
 
     X = []
-    acc = 0
-    u_prev = u0
 
-    # Inverse computed before the for loop for speed
     N = K.shape[0]
-    Kc = np.linalg.cholesky(K + 1e-6 * np.eye(N))
-    Kc_inverse = np.linalg.inv(Kc)
-    K_inverse = Kc_inverse @ Kc_inverse.T # TODO: compute the inverse of K using its Cholesky decomopsition
+    u_prev = Kc @ rng.standard_normal(N)
+    posterior_prev = log_posterior(u_prev, data, K_inv, mask)
 
-    lt_prev = log_target(u_prev, data, K_inverse, G)
+    for _ in tqdm(range(n_iters)):
+        # Proposal step
+        u = u_prev + beta * Kc @ rng.standard_normal(N)
 
-    for i in tqdm(range(n_iters)):
+        # Calculate posterior with this sample
+        posterior = log_posterior(u, data, K_inv, mask)
 
-        u_new = u_prev + beta * Kc @ rng.standard_normal(len(u0)) # TODO: Propose new sample - use prior covariance, scaled by beta
-
-        lt_new = log_target(u_new, data, K_inverse, G)
-
-        log_alpha = min(lt_new - lt_prev, 0) # TODO: Calculate acceptance probability based on lt_prev, lt_new
-        log_u = np.log(rng.random())
-
-        # Accept/Reject
-        accept = log_u <= log_alpha # TODO: Compare log_alpha and log_u to accept/reject sample (accept should be boolean)
+        # Metropolis-Hastings accept/reject
+        accept = np.log(rng.random()) <= min(posterior - posterior_prev, 0)
         if accept:
-            acc += 1
-            X.append(u_new)
-            u_prev = u_new
-            lt_prev = lt_new
+            X.append(u)
+            u_prev = u
+            posterior_prev = posterior
         else:
             X.append(u_prev)
 
-    return X, acc / n_iters
+    return X
 
-def mcmc_mh_pcn(log_likelihood, u0, y, K, G, n_iters, beta, rng=np.random.default_rng()):
-    """ pCN MCMC method for sampling from pdf defined by log_prior and log_likelihood.
-    Inputs:
-        log_likelihood - log-likelihood function
-        u0 - initial sample
-        y - observed data
-        K - prior covariance
-        G - observation matrix
-        n_iters - number of samples
-        beta - step-size parameter
+def mcmc_mh_pcn(
+        log_likelihood: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray], 
+        data: np.ndarray,
+        K: np.ndarray,
+        mask: np.ndarray,
+        n_iters: int,
+        beta: float,
+        rng: np.random.Generator = np.random.default_rng()        
+        ):
+    """MCMC using pCN proposal to sample from log_likelihood.
+
+    Args:
+        log_likelihood (Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]): log likelihood to sample from.
+        data (np.ndarray): observed data
+        K (np.ndarray): Gaussian process prior covariance matrix
+        mask (np.ndarray): data observation mask
+        n_iters (int): number of iterations to run MCMC
+        beta (float): step-size
+        rng (np.random.Generator, optional): random number generator. Defaults to np.random.default_rng().
+
     Returns:
-        X - samples from target distribution
-        acc/n_iters - the proportion of accepted samples"""
-    N = K.shape[0]
-    Kc = np.linalg.cholesky(K + 1e-6 * np.eye(N))
+        X: list of samples
+    """
+
+    # Cholesky decomposition
+    Kc = cholesky_decomposition(K)
+
     X = []
-    acc = 0
-    u_prev = u0
 
-    ll_prev = log_likelihood(u_prev, y, G)
+    N = K.shape[0]
+    u_prev = Kc @ rng.standard_normal(N)
+    likelihood_prev = log_likelihood(u_prev, data, mask)
 
-    for i in tqdm(range(n_iters)):
+    for _ in tqdm(range(n_iters)):
+        # pCN proposal step
+        u = np.sqrt(1 - beta**2) * u_prev + beta * Kc @ rng.standard_normal(N)
 
-        u_new = np.sqrt(1 - beta**2) * u_prev + beta * Kc @ rng.standard_normal(len(u0)) # TODO: Propose new sample using pCN proposal
+        # Calculate likelihood. Note that prior isn't used here as it cancels out in the acceptance step
+        likelihood = log_likelihood(u, data, mask)
 
-        ll_new = log_likelihood(u_new, y, G)
-
-        log_alpha = min(ll_new - ll_prev, 0) # TODO: Calculate pCN acceptance probability
-        log_u = np.log(rng.random())
-
-        # Accept/Reject
-        accept = log_u <= log_alpha # TODO: Compare log_alpha and log_u to accept/reject sample (accept should be boolean)
+        # Metropolis-Hastings accept/reject
+        accept = np.log(rng.random()) <= min(likelihood - likelihood_prev, 0)
         if accept:
-            acc += 1
-            X.append(u_new)
-            u_prev = u_new
-            ll_prev = ll_new
+            X.append(u)
+            u_prev = u
+            likelihood_prev = likelihood
         else:
             X.append(u_prev)
 
-    return X, acc / n_iters
+    return X

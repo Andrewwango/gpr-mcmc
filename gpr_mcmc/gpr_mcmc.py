@@ -79,7 +79,7 @@ class GaussianProcessMCMCRegressor:
 
     Args:
         kernel (sklearn.gaussian_process.kernels.Kernel, optional): Any GPR kernel from `scikit-learn` kernels. If None, RBF kernel is used with ell given by `ell`. Defaults to None.
-        log_likelihood (str | callable], optional): If str, must be one of `poisson`, `gaussian` or `probit`. If a callable, see `likelihoods.py` for example implementations. Defaults to 'poisson'.
+        log_likelihood (str | callable], optional): If str, must be one of `poisson`, `gaussian` or `probit`. If a callable, see `likelihoods.py` for example implementations. See below for more info Defaults to 'poisson'.
         optimizer (None, optional): Not yet implemented. Defaults to None.
         random_state (int | np.random.Generator | None, optional): If int, seeds a new numpy random number generator. Prefer using a Generator as per numpy recommendations. Defaults to None.
         latent_mapper (None | callable, optional): Ignore if using built-in likelihood functions. If using a custom likelihood, see `likelihoods.py` for tips. Defaults to None.
@@ -87,6 +87,11 @@ class GaussianProcessMCMCRegressor:
         beta (float, optional): step size using in MCMC proposals. Controls the "temperature" of the sampling. Defaults to 0.2.
         ell (float | None, optional): Length scale of the RBF kernel if kernel is None. If None, this defaults to 2. Defaults to None.
         mcmc_method (str, optional): MCMC variant to use. "grw" is Gaussian random walk - Metropolis-Hastings with a Gaussian prior proposal. "pcn" is preconditioned Crank-Nicholson which does not degenerate in infinite-dimensions. Defaults to "pcn".
+    
+    Note on likelihoods: this describes the log likelihood of the underlying latent field u \in \mathbb{R} to be sampled.
+    If passing a custom likelihood, and your latent field is not \mathbb{R} (e.g. Poisson must be positive only) then also 
+    set latent_mapper to describe the auxiliary variable mapping (e.g. np.exp for Poisson)
+    
     """
     def __init__(
             self, 
@@ -101,15 +106,12 @@ class GaussianProcessMCMCRegressor:
             mcmc_method: str = "pcn"
             ): 
 
-        #docs for likelihood: describes the log likelihood of the underlying latent field u \in \mathbb{R} to be sampled.
-        #if passing a custom likelihood, and your latent field is not \mathbb{R} (e.g. Poisson must be positive only) then
-        #also set latent_mapper to describe the auxiliary variable mapping (e.g. np.exp for Poisson)
-
         self.kernel = kernel
         self.log_likelihood, self.latent_mapper = check_likelihood(log_likelihood, latent_mapper)
+        self.rng = check_random_state(random_state)
+        
         #TODO: if optimizer is passed, perform scipy.optimize.minimize on log_marginal_likelihood with kernel parameters 
         self.optimizer = optimizer
-        self.rng = check_random_state(random_state)
         
         if mcmc_method == "pcn":
             self.mcmc = mcmc_mh_pcn
@@ -123,39 +125,51 @@ class GaussianProcessMCMCRegressor:
         self.ell = 2 if ell is None else ell
 
         if self.kernel is None:  # Use an RBF kernel as default
-            self.kernel_ = ConstantKernel(1.0, constant_value_bounds="fixed") \
-                * RBF(self.ell, length_scale_bounds="fixed")
+            self.kernel_ = ConstantKernel(1.0, constant_value_bounds="fixed") * RBF(self.ell, length_scale_bounds="fixed")
         elif self.kernel is not None and ell is not None:
             raise ValueError("ell argument can only be specified when kernel is not specified, in order to use the default RBF kernel with length-scale ell.")
         else:
             self.kernel_ = clone(self.kernel)
 
-    def fit(self, X, y):
+    def fit(self, X: np.ndarray, y: np.ndarray) -> object:
+        """Fit Gaussian Process Regression model using MCMC
+
+        Args:
+            X (np.ndarray): training data features of shape (n_samples, n_features)
+            y (np.ndarray): training data targets of shape (n_samples,)
+
+        Returns:
+            object: fitted model
+        """
         #TODO: check inputs
         self.X_train_ = X
         self.y_train_ = y
-        #TODO: add precompute K inverse using Cholesky (currently in mcmc)
+
         return self
 
-    def predict(self, X, G=None, return_train_preds=False):
-        #TODO: check input
-        check_is_fitted(self, ("X_train_", "y_train_"))
+    def predict(self, X: np.ndarray, return_train_preds: bool = False) -> np.ndarray:
+        """Predict using the Gaussian process regression model. 
 
-        #if type(X) is TestGrid:
-        #    X = X.X
+        Args:
+            X (np.ndarray): test data features of shape (n_samples, n_features)
+            return_train_preds (bool, optional): whether to test the model on the original training points too. Defaults to False.
+
+        Returns:
+            np.ndarray: predictions on test data
+        """
+        #TODO: check input
+
+        check_is_fitted(self, ("X_train_", "y_train_"))
 
         M = self.X_train_.shape[0]
         N = X.shape[0] + M
-        X_dash = np.vstack([X, self.X_train_])
-        #X_dash = X
+        X_dash = np.vstack([X, self.X_train_]) # all data
 
-        G = np.hstack([np.zeros((M, N - M)), np.eye(M)])
+        mask = np.hstack([np.zeros((M, N - M)), np.eye(M)])
 
         K = self.kernel_(X_dash)
-        Kc = np.linalg.cholesky(K + 1e-6 * np.eye(N))
-        u0 = Kc @ self.rng.standard_normal((N, ))
-
-        samples, acc_pcn = self.mcmc(self.log_likelihood, u0, self.y_train_, K, G, self.n, self.beta, self.rng)
+        
+        samples = self.mcmc(self.log_likelihood, self.y_train_, K, mask, self.n, self.beta, self.rng)
 
         y_dash_pred_bar = expected_predpost_from_samples(samples, latent_mapper=self.latent_mapper)
         y_dash_pred_var = variance_predpost_from_samples(samples, latent_mapper=self.latent_mapper)
@@ -165,8 +179,19 @@ class GaussianProcessMCMCRegressor:
 
         return y_pred_bar
     
-    def score(self, X, y, method="r2"):
+    def score(self, X: np.ndarray, y: np.ndarray, method: str = "r2") -> float:
+        """Calculate score based on test data and test data ground truth targets
+
+        Args:
+            X (np.ndarray): test data features of shape (n_samples, n_features)
+            y (np.ndarray): test data ground truth targets of shape (n_samples,)
+            method (str, optional): R2 (coefficient of determination) or MAE (mean absolute error). Defaults to "r2".
+
+        Returns:
+            float: model score
+        """
         y_pred = self.predict(X, return_train_preds=False)
+
         if method in ("r2", "r2_score"):
             func = r2_score
         elif method == "mae":
@@ -187,12 +212,10 @@ class GaussianProcessMCMCRegressor:
         pass
 
     @staticmethod
-    def plot(X, y, ax=None, title=None, pos_only=True):
+    def plot(X: np.ndarray, y: np.ndarray, ax=None, title=None, pos_only=True):
         if ax is None:
             fig, ax = plt.subplots()
 
         plot_2D(ax, y, X[:,0], X[:,1], title=title, pos_only=pos_only)
-
-        #return fig
 
     
